@@ -1,0 +1,1213 @@
+import requests, os, json, telebot, threading, sqlite3, re
+import pandas as pd
+from requests.exceptions import HTTPError
+from telebot import types
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, g
+from requests_toolbelt.multipart.encoder import MultipartEncoder
+import time
+from datetime import datetime, timedelta
+
+load_dotenv()  # Load environment variables from a .env file
+import re
+bot = telebot.TeleBot('7261059776:AAGRxzMMkpJ5m6MM0MTj_s0zU-xEdlMpPz8')
+CHAT_ID = '-1002601570483'        #'913493432'
+WHAPI_TOKEN = "CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+app = Flask(__name__)
+
+# Создаем или открываем базу данных
+conn = sqlite3.connect('your_database.db', check_same_thread=False)
+cursor = conn.cursor()
+
+# Создание таблицы, если она не существует
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS drivers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    car_number TEXT,
+    route TEXT,
+    phone_number TEXT,
+    driver_status TEXT,
+    driver_status2 TEXT,
+    timepogruzka TEXT,
+    bot_accent TEXT,    
+    timeout TEXT,
+    os TEXT,
+    os_accept INTEGER DEFAULT 0,
+    break_end_time DATETIME,  --  Время окончания перерыва
+    break_duration TEXT,  --  Длительность перерыва
+    pogruzka_start_time DATETIME,
+    at_loading INTEGER DEFAULT 0,  -- 0: не на погрузке, 1: на погрузке
+    on_break INTEGER DEFAULT 0 -- 0: не на перерыве, 1: на перерыве
+)
+''')
+
+
+def send_verification_notification_telegram(car_number):
+    """Отправляет уведомление о запросе верификации в Telegram."""
+    markup = types.InlineKeyboardMarkup()
+    button = types.InlineKeyboardButton(text="Подтвердить✅", callback_data=f"yes")  # Use a unique callback data
+    button1 = types.InlineKeyboardButton(text="Отклонить❌", callback_data=f"no") # Use a unique callback data
+    markup.row(button, button1)
+    try:
+        bot.send_message(CHAT_ID, text="Новая регистрация: " + '\n' + car_number, reply_markup=markup)
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки сообщения в Telegram: {e}")
+        return False
+    
+    
+@app.before_request
+def before_request():
+    g.processed_polls = getattr(g, 'processed_polls', set())
+    
+        
+def send_waiting(car_number):
+    """Отправляет уведомление о запросе верификации в Telegram."""
+    markup = types.InlineKeyboardMarkup()
+    button = types.InlineKeyboardButton(text="Добавить маршрут", callback_data=f"add_route:{car_number}")  # Use a unique callback data
+    markup.row(button)
+    try:
+        bot.send_message(CHAT_ID, text=f"Водитель {car_number} неактивен: " + '\n', reply_markup=markup)
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки сообщения в Telegram: {e}")
+        return False
+    
+    
+def send_waiting_polomka(car_number, message):
+    """Отправляет уведомление о запросе верификации в Telegram."""
+    markup = types.InlineKeyboardMarkup()
+    button = types.InlineKeyboardButton(text="Добавить маршрут", callback_data=f"add_route:{car_number}")  # Use a unique callback data
+    markup.row(button)
+    try:
+        bot.send_message(CHAT_ID,f"‼️У водителя {car_number[0]}, {message} на погрузке, погрузка отменена",reply_markup=markup)
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки сообщения в Telegram: {e}")
+        return False
+    
+    
+def send_whapi_request1(text, number):
+    """Отправляет текстовое сообщение через WHAPI."""
+    try:
+        url = "https://gate.whapi.cloud/messages/text"
+
+        payload = {
+            "typing_time": 0,
+            "body": text,
+            "to": str(number+"@s.whatsapp.net")
+        }
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "authorization": f"Bearer {WHAPI_TOKEN}"
+        }
+
+        response = requests.post(url, json=payload, headers=headers)
+
+    except requests.exceptions.RequestException as e:
+        ...
+        # Handle the exception as needed (e.g., retry, notify admin)
+        
+
+def send_delayed_message(phone_number, car_number):
+    """Отправляет сообщение о задержке погрузки диспетчеру, если прошло 2 часа."""
+    try:
+        time.sleep(7200)  # Ждем 2 часа (в секундах)
+
+        conn = sqlite3.connect('your_database.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT pogruzka_start_time, at_loading FROM drivers WHERE phone_number = ?", (phone_number,))
+        result = cursor.fetchone()
+        conn.close()
+
+        if result:
+            loading_start_time_str, at_loading = result
+            if at_loading == 1 and loading_start_time_str:
+                try:
+                    loading_start_time = datetime.fromisoformat(loading_start_time_str)
+                    elapsed_time = datetime.now() - loading_start_time
+                    if elapsed_time >= timedelta(hours=2):
+                        message = f"Задержка погрузки более 2 часов для водителя с номером машины {car_number}!"
+                        bot.send_message(CHAT_ID, message)
+
+                        # Сбрасываем состояние водителя (погрузка завершена или сообщение отправлено)
+                        conn = sqlite3.connect('your_database.db')
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE drivers SET at_loading = 0, pogruzka_start_time = NULL WHERE phone_number = ?", (phone_number,))
+                        conn.commit()
+                        conn.close()
+                except ValueError as e:
+                    ...
+    except Exception as e:
+        ...
+        # Log the error, consider sending a notification to the admin
+        
+
+def send_interactive_message(phone_number, header_text, button_list):
+    url = "https://gate.whapi.cloud/messages/interactive"
+    buttons = [{"type": "quick_reply", "title": title, "id": str(i)} for i, title in enumerate(button_list)]
+    payload = {
+        "header": {"text": header_text},
+        "action": {"buttons": buttons},
+        "type": "button",
+        "to": phone_number + '@s.whatsapp.net'
+    }
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {WHAPI_TOKEN}"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        ...
+        
+        
+def c(phone_number, new_os_value, os_ac):
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+    UPDATE drivers
+    SET os = ?,
+        os_accept = ?
+    WHERE phone_number = ?''', 
+    (new_os_value, os_ac, phone_number))
+    # Сохраняем изменения
+    conn.commit()        
+     
+
+def check_car_number(input_text, result):
+    # Регулярное выражение для проверки номера автомобиля в России (русская и английская раскладка)
+    pattern = r'^[А-ЯA-Z]{1}\d{3}[А-ЯA-Z]{2}\d{2,3}$'
+    # Доступные буквы в русском номере
+    valid_chars = 'АВЕКМНОРСТУХABEKMHOPCTYX'
+    # Убираем недопустимые символы
+    input_text_cleaned = ''.join(filter(lambda x: x in valid_chars or x.isdigit(), input_text.upper()))
+    # Проверка на допустимый номер
+    if re.match(pattern, input_text_cleaned):
+        return True
+    if input_text != "Недопустимые символы" and input_text != 'Начать' and input_text != 'Введите номер вашей машины' and input_text != 'Ваш запрос отправлен на подтверждение диспетчеру' and input_text != 'Ваш аккаунт успешно подтвержден, у вас есть доступ к функционалу бота.' and input_text != 'Ожидайте новый маршрут, диспетчер уведомлён' and "Ваш перерыв оформлен." not in input_text and input_text != 'Ожидайте маршрут!' and "Сообщение от диспетчера" not in input_text and input_text != 'Связь с диспетчер' and "Диспетчер" not in input_text:
+        return "Недопустимые символы"
+
+
+
+
+def handle_break_time_selection(phone_number):
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT on_break FROM drivers WHERE phone_number = ?", (phone_number,))
+    on_break = cursor.fetchone()[0]
+    conn.close()
+
+    if on_break == 1:
+        send_whapi_request1("Вы уже находитесь на перерыве.", phone_number)
+    else:
+        break_times = ["1 час", "3 часа", "5 часов", "7 часов", "10 часов"]
+        send_interactive_message(phone_number, "Выберите длительность перерыва:", break_times)
+
+
+# Функция для обработки выбора причины перерыва
+def handle_break_reason_selection(phone_number, break_duration):
+    break_reasons = ["По семейным обстоятельствам", "По состоянию здоровья", "Личные нужды", "Техническая неисправность", "Другое"]
+    send_interactive_message(phone_number, "Укажите причину перерыва:", break_reasons)
+
+
+# Функция для обработки выбора причины перерыва
+def handle_break_reason_selection_ios(phone_number, break_duration):
+    break_reasons = ["По семейным обстоятельствам", "По состоянию здоровья", "Личные нужды", "Техническая неисправность", "Другое"]
+    send_pool(phone_number, break_reasons,'Выберите')
+
+
+# Функция для обновления статуса водителя и отправки информации диспетчеру
+def update_driver_status_and_notify_dispatcher(phone_number, break_duration, break_reason):
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    sql_query = '''
+            UPDATE drivers
+            SET driver_status = 'На перерыве'
+            WHERE phone_number = ?
+            '''
+            
+            # Выполнение запроса
+    cursor.execute(sql_query, (phone_number,))
+    conn.commit()
+    # Получаем номер машины водителя для отправки сообщения диспетчеру
+    cursor.execute("SELECT car_number FROM drivers WHERE phone_number = ?", (phone_number,))
+    car_number = cursor.fetchone()[0]  # Assuming car_number is the first element
+
+    # Вычисляем время окончания перерыва
+    now = datetime.now()
+    if break_duration == "1 час":
+        break_end_time = now + timedelta(hours=1)
+    elif break_duration == "3 часа":
+        break_end_time = now + timedelta(hours=3)
+    elif break_duration == "5 часов":
+        break_end_time = now + timedelta(hours=5)
+    elif break_duration == "7 часов":
+        break_end_time = now + timedelta(hours=7)
+    elif break_duration == "10 часов":
+        break_end_time = now + timedelta(hours=10)
+    else:
+        break_end_time = None
+
+    # Обновляем данные в базе данных
+    cursor.execute("UPDATE drivers SET driver_status = 'На перерыве', on_break = 1, break_duration = ?, break_end_time = ? WHERE phone_number = ?", (break_duration, break_end_time.isoformat() if break_end_time else None, phone_number))
+    conn.commit()
+
+    # Формируем сообщение для диспетчера
+    message_to_dispatcher = f"Водитель {car_number} взял перерыв на {break_duration} по причине: {break_reason}. " \
+                             f"Конец перерыва: {break_end_time.strftime('%Y-%m-%d %H:%M:%S') if break_end_time else 'Не определено'}"
+
+    # Отправляем сообщение диспетчеру
+    bot.send_message(CHAT_ID, message_to_dispatcher)
+
+    conn.close()
+
+    # Запускаем поток для отправки уведомления об окончании перерыва
+    # if break_end_time:
+    #     threading.Thread(target=send_break_end_notification, args=(phone_number, break_end_time)).start()
+
+import sqlite3
+
+def add_driver_with_phone(phone_number, car_number=None, route=None, driver_status=None, driver_status2=None, timepogruzka=None, bot_accent=None, timeout=None, break_end_time=None, break_duration=None, pogruzka_start_time=None, at_loading=0, on_break=0):
+    """
+    Добавляет нового водителя в базу данных, заполняя только phone_number и, опционально, остальные поля.
+    """
+    conn = sqlite3.connect('your_database.db', check_same_thread=False)
+    cursor = conn.cursor()
+
+    try:
+        # Формируем строку SQL-запроса для вставки данных
+        sql_query = '''
+            INSERT INTO drivers (phone_number, car_number, route, driver_status, driver_status2,
+                                 timepogruzka, bot_accent, timeout, break_end_time, break_duration,
+                                 pogruzka_start_time, at_loading, on_break)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        '''
+
+        # Создаем кортеж значений для вставки
+        values = (phone_number, car_number, route, driver_status, driver_status2,
+                  timepogruzka, bot_accent, timeout, break_end_time, break_duration,
+                  pogruzka_start_time, at_loading, on_break)
+
+        # Выполняем SQL-запрос
+        cursor.execute(sql_query, values)
+
+        conn.commit()
+        return True
+
+    except sqlite3.Error as e:
+        conn.rollback()
+        return False
+
+    finally:
+        conn.close()
+
+
+
+def convert_to_english_letters(text):
+    # Словарь для замены русских букв на английские
+    trans_dict = {
+        'А': 'A',
+        'В': 'B',
+        'Е': 'E',
+        'К': 'K',
+        'М': 'M',
+        'Н': 'H',
+        'О': 'O',
+        'Р': 'P',
+        'С': 'C',
+        'Т': 'T',
+        'У': 'Y',
+        'Х': 'X'
+    }
+    
+    result = []
+    for char in text.upper():
+        # Если символ есть в словаре замены, заменяем его
+        if char in trans_dict:
+            result.append(trans_dict[char])
+        else:
+            result.append(char)
+    return ''.join(result)
+def delete_pool(number):
+    url = f"https://gate.whapi.cloud/messages/{number}"
+
+    headers = {
+        "accept": "application/json",
+        "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+    }
+
+    response = requests.delete(url, headers=headers)
+    return True
+
+def delete_reply(id):
+    url = f"https://gate.whapi.cloud/messages/{id}"
+
+    headers = {
+        "accept": "application/json",
+        "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+    }
+
+    response = requests.delete(url, headers=headers)
+    return True
+
+
+
+def send_pool(number, operating_system_options,text):
+    url = "https://gate.whapi.cloud/messages/poll"
+    
+    # Формируем payload
+    payload = {
+        "options": operating_system_options,  # Передаем операционные системы
+        "to": f"{number}@s.whatsapp.net",
+        "quoted": f"GoodWays-{number}",
+        "count": 1,
+        "title": text
+    }
+    
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+    }
+
+    # Отправляем запрос
+    response = requests.post(url, json=payload, headers=headers)
+# Словарь для хранения времени последней обработки запроса для каждого пользователя
+last_processed = {}
+lock = threading.Lock()
+@app.route('/hook', methods=['POST'])
+def handle_new_messages():
+    try:
+        print(request.json)
+        if 'messages' in request.json and request.json['messages']:
+            # Обработка обычных сообщений
+            for i in request.json['messages']:
+                number = i['chat_id'][:-15]
+                id = i['id']
+                if number == '79856810435':
+                    number = i['from']
+
+                conn = sqlite3.connect('your_database.db', check_same_thread=False)
+                cursor = conn.cursor()
+                cursor.execute("SELECT bot_accent FROM drivers WHERE phone_number = ?", [number])
+                result = cursor.fetchone()
+                cursor.execute("SELECT route FROM drivers WHERE phone_number = ?", [number])
+                route1 = cursor.fetchone()
+                cursor.execute("SELECT driver_status FROM drivers WHERE phone_number = ?", [number])
+                driver_status = cursor.fetchone()
+                cursor.execute("SELECT driver_status2 FROM drivers WHERE phone_number = ?", [number])
+                driver_status2 = cursor.fetchone()
+                # Проверка типа сообщения
+                if 'text' in i:  # Если сообщение текстовое
+                    message = i['text']['body']
+                elif i['type'] == "reply":  # Если сообщение связано с кнопкой  
+                    message = (((i['reply'])['buttons_reply'])['title'])
+                    number = (str(i['chat_id']))[:-15]
+                cursor.execute("SELECT bot_accent,route FROM drivers WHERE phone_number = ?", [number])
+                result = cursor.fetchall()
+                conn.close() # Закрываем соединение после использования.
+               
+
+        elif 'statuses' in request.json and request.json['statuses']:
+            pass
+
+        elif request.json['messages_updates']:
+            for update in request.json['messages_updates']:
+                id = (update['id'])
+                number = (update['trigger'])['from']
+
+                with lock:
+                    now = datetime.now()
+                    if number in last_processed and now - last_processed[number] < timedelta(seconds=5):
+                        print(f"Повторный запрос от {number} игнорируется.")
+                        return "OK", 200  # Игнорируем повторный запрос
+
+                    last_processed[number] = now
+
+                # ... (ваш код обработки опроса, включая работу с базой данных и отправку сообщений)
+                if 'after_update' in update and 'poll' in update['after_update']:
+                    id = (update['id'])
+                    if id in g.processed_polls:
+                        continue
+
+                    total_votes = update['after_update']['poll']['total']
+                    if total_votes > 0:
+                        winners = []
+                        for result in update['after_update']['poll']['results']:
+                            if result['count'] > 0:
+                                winners.append(result['name'])
+                        if winners:
+                            print(winners)
+                            first_winner = winners[0]
+                            if 'Android' in winners:
+                                c(number,"android",'1')
+                                send_whapi_request1("Введите номер вашей машины",number)
+                                delete_pool(id)
+                            if 'iphone' in winners:
+                                c(number,"ios",'1')
+                                send_whapi_request1("Введите номер вашей машины",number)
+                                delete_pool(id)
+                            if 'Завершить разгрузку' in winners:
+                                delete_pool(id)
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+
+                                # SQL-запрос для обновления
+                                # SQL-запрос для обновления
+                                sql_query = '''
+                                UPDATE drivers
+                                SET driver_status2 = 'На погрузку', driver_status = 'В пути'
+                                WHERE phone_number = ?
+                                '''
+
+                                # Выполнение запроса обновления
+                                cursor.execute(sql_query, (number,))
+
+                                # Запрос маршрута и номера машины
+                                cursor.execute(
+                                    "SELECT route, car_number FROM drivers WHERE phone_number = ?",
+                                    (number,),
+                                )
+
+                                result = cursor.fetchone()
+                                conn.commit()
+                                conn.close()
+
+                                if result:
+                                    route = result[0].split('-')
+                                    if len(route) > 0:  # Убедитесь, что маршрут непустой
+                                        send_pool(number,['Прибыл на погрузку','Связь с диспетчером'],f"Ваш маршрут. На склад В {route[0]}, Хорошей дороги!")
+                                else:
+                                    print("Нет результатов для указанного номера телефона.")
+                            if "Прибыл на погрузку" in winners :
+                                delete_pool(id)
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+                                
+                                # Проверяем текущий статус водителя
+                                cursor.execute("SELECT driver_status FROM drivers WHERE phone_number = ?", (number,))
+                                current_status = cursor.fetchone()
+                                
+                                if current_status and current_status[0] != 'На погрузке':  # Проверяем, что водитель еще не на погрузке
+                
+                                    
+                                    cursor.execute("SELECT route FROM drivers WHERE phone_number = ?", (number,))
+                                    a = cursor.fetchone()
+                                    
+                                    # SQL-запрос для обновления
+                                    sql_query = '''
+                                    UPDATE drivers
+                                    SET driver_status = 'На погрузке'
+                                    WHERE phone_number = ?
+                                    '''
+                                    
+                                    # Выполнение запроса
+                                    cursor.execute(sql_query, (number,))
+                                    
+                                    # Сохранение изменений и закрытие соединения
+                                    conn.commit()
+                                    
+                                    # Записываем время начала погрузки и меняем состояние
+                                    now = datetime.now()
+                                    cursor.execute("UPDATE drivers SET at_loading = 1, pogruzka_start_time = ? WHERE phone_number = ?", 
+                                                (now.isoformat(), number))
+                                    conn.commit()
+                                    conn.close()
+                                    
+                                    send_pool(number, ['Завершить погрузку', 'Связь с диспетчером'],
+                                            f"Вы прибыли на склад в {a[0]}")
+                                    
+                                    # Запускаем поток для проверки времени погрузки
+                                    conn = sqlite3.connect('your_database.db')
+                                    cursor = conn.cursor()
+                                    cursor.execute("SELECT car_number FROM drivers WHERE phone_number = ?", (number,))
+                                    car = cursor.fetchone()
+                                    conn.close()
+                                    
+                                    if car:
+                                        threading.Thread(target=send_delayed_message, args=(number, car[0])).start()
+                                else:
+                                    conn.close()
+                                    # Можно отправить сообщение, что действие уже выполнено
+                                    send_pool(number, [], "Вы уже на погрузке")
+                            if "Прибыл на разгрузку" in winners:
+                                delete_pool(id)
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+                                
+                                # SQL-запрос для обновления
+                                sql_query = '''
+                                UPDATE drivers
+                                SET driver_status = 'На разгрузке'
+                                WHERE phone_number = ?
+                                '''
+                                
+                                # Выполнение запроса
+                                cursor.execute(sql_query, (number,))
+                                
+                                # Сохранение изменений и закрытие соединения
+                                conn.commit()
+                                # Записываем время начала погрузки и меняем состояние
+                                now = datetime.now()
+                                cursor.execute("UPDATE drivers SET at_loading = 1, pogruzka_start_time = ? WHERE phone_number = ?", (now.isoformat(), number))
+                                conn.commit()
+                                conn.close()
+                                
+                                send_pool(number,['Завершить разгрузку','Связь с диспетчером'],"Управление")
+                                #Запускаем поток для проверки времени погрузки
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT car_number FROM drivers WHERE phone_number = ?", (number,))
+                                car = cursor.fetchone()
+                                conn.close()
+                                if car:
+                                    threading.Thread(target=send_delayed_message, args=(winners[0], car[0])).start()
+                            if 'Завершить разгрузку' in winners:
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+                                sql_query = """
+                                UPDATE drivers
+                                SET driver_status = ?, route = ?
+                                WHERE phone_number = ?"""
+                                cursor.execute(sql_query, ("В пути", route, number))
+                                conn.commit()
+                                cursor.execute(
+                                    "SELECT route, car_number FROM drivers WHERE phone_number = ?",
+                                    (number,),
+                                )
+                                route = route.split('-')
+                                result = cursor.fetchone()
+                                if result:
+                                    conn = sqlite3.connect('your_database.db')
+                                    cursor = conn.cursor()
+                                    
+                                    # SQL-запрос для обновления
+                                    sql_query = '''
+                                    UPDATE drivers
+                                    SET driver_status2 = 'На погрузку'
+                                    WHERE phone_number = ?
+                                    '''
+                                    
+                                    # Выполнение запроса
+                                    cursor.execute(sql_query, (result[1],))
+                                    
+                                    # Сохранение изменений и закрытие соединения
+                                    conn.commit()
+                                    url = "https://gate.whapi.cloud/messages/poll"
+        
+                                    # Формируем payload
+                                    payload = {
+                                        "options": ['Прибыл на погрузку','Связь с диспетчером'],  # Передаем операционные системы
+                                        "to": result[1]+"@s.whatsapp.net",
+                                        "count": 1,
+                                        "title": "Ваш новый маршрут. На склад В " + route[0] + ", Хорошей дороги!"
+                                    }
+                                    
+                                    headers = {
+                                        "accept": "application/json",
+                                        "content-type": "application/json",
+                                        "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                                    }
+
+                                    # Отправляем запрос
+                                    response = requests.post(url, json=payload, headers=headers)
+                            if "Завершить погрузку" in winners:
+                                delete_pool(id)
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+                                
+                            
+                                # SQL-запрос для обновления
+                                sql_query = '''
+                                UPDATE drivers
+                                SET driver_status2 = "На выгрузку"
+                                WHERE phone_number = ?
+                                '''
+                                
+                                # Выполнение запроса
+                                cursor.execute(sql_query, (number,))
+                                conn.commit()
+                                conn.close()
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+                                # Сбрасываем состояние
+                                cursor.execute("SELECT route FROM drivers WHERE phone_number = ?", (number,))
+                                route = cursor.fetchone()
+                                sql_query = '''
+                                UPDATE drivers
+                                SET driver_status = 'В пути'
+                                WHERE phone_number = ?
+                                '''
+                                # Выполнение запроса
+                                cursor.execute(sql_query, (number,))
+                                s = (route[0]).split('-')
+                                cursor.execute("UPDATE drivers SET at_loading = 0, pogruzka_start_time = NULL WHERE driver_status = 'В пути' OR phone_number = ?", (number,))
+                                conn.commit()
+                                conn.close()
+                                send_pool(number,['Прибыл на разгрузку','Связь с диспетчером'], f"Ваш путь до разгрузки на склад в {s[1]}")
+                            if  winners[0] in 'Связь с диспетчером':
+                                conn = sqlite3.connect('your_database.db')
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT route FROM drivers WHERE phone_number = ?", (number,))
+                                route = cursor.fetchone()
+                                cursor.execute("SELECT phone_number FROM drivers WHERE phone_number = ?", (number,))
+                                result1 = cursor.fetchone()
+                                conn.close()
+
+                                # Получение текущего времени и дня недели
+                                now = datetime.now()
+                                current_time = now.time()
+                                current_day = now.weekday()  # 0 — понедельник, 6 — воскресенье
+
+                                # Определение контакта по времени и дню недели
+                                if current_time >= datetime.strptime("21:00", "%H:%M").time() or current_time < datetime.strptime("09:00", "%H:%M").time():
+                                    # url = "https://gate.whapi.cloud/messages/contact"
+
+                                    # payload = {
+                                    #     "to": number,
+                                    #     "name": "Диспетчер",
+                                    #     "vcard": "BEGIN:VCARD      VERSION:3.0      FN:Алексей      TEL;TYPE=CELL:+79001664820      EMAIL:example@example.com      END:VCARD"
+                                    # }
+                                    # headers = {
+                                    #     "accept": "application/json",
+                                    #     "content-type": "application/json",
+                                    #     "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                                    # }
+
+                                    # response = requests.post(url, json=payload, headers=headers)
+                                    send_whapi_request1("Диспетчер Алексей, +79001664820",number)
+                                elif current_day in range(0, 5):  # Пн-Пт
+                                    # url = "https://gate.whapi.cloud/messages/contact"
+
+                                    # payload = {
+                                    #     "to": number,
+                                    #     "name": "Диспетчер",
+                                    #     "vcard": "BEGIN:VCARD      VERSION:3.0      FN:Динара      TEL;TYPE=CELL:+7 927 161-23-60      EMAIL:example@example.com      END:VCARD"
+                                    # }
+                                    # headers = {
+                                    #     "accept": "application/json",
+                                    #     "content-type": "application/json",
+                                    #     "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                                    # }
+
+                                    # response = requests.post(url, json=payload, headers=headers)
+                                    send_whapi_request1("Диспетчер Динара, +79271612360",number)
+                                else:  # Сб-Вс
+                                    # url = "https://gate.whapi.cloud/messages/contact"
+
+                                    # payload = {
+                                    #     "to": number,
+                                    #     "name": "Диспетчер",
+                                    #     "vcard": "BEGIN:VCARD      VERSION:3.0      FN:Карина      TEL;TYPE=CELL:79884994041      EMAIL:example@example.com      END:VCARD"
+                                    # }
+                                    # headers = {
+                                    #     "accept": "application/json",
+                                    #     "content-type": "application/json",
+                                    #     "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                                    # }
+
+                                    # response = requests.post(url, json=payload, headers=headers)    
+                                    send_whapi_request1("Диспетчер Карина, +79884994041",number)         
+                            g.processed_polls.add(id)
+                    
+                        
+
+        else:
+            return jsonify({'status': 'unknown'}), 400
+        conn = sqlite3.connect('your_database.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT os FROM drivers WHERE phone_number = ?", (number,))
+        result_os = cursor.fetchone()
+        cursor.execute("SELECT bot_accent FROM drivers WHERE phone_number = ?", (number,))
+        bot = cursor.fetchone()
+
+        
+        if message == "Начать":
+            url = "https://gate.whapi.cloud/messages/poll"
+
+            payload = {
+                "options": ["Android", "iphone"],
+                "to": number + '@s.whatsapp.net',
+                "count": 1,
+                "title": "Выберите вашу опереционную систему"
+            }
+            headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+            }
+
+            response = requests.post(url, json=payload, headers=headers)
+            add_driver_with_phone(number)
+            # text = "Введите ваш Номер машины"
+            # send_whapi_request1(text,number)
+        if 'text' in i :  # Если сообщение текстовое
+            message = i['text']['body']
+            car_number_check_result = check_car_number(message,bot)
+            if car_number_check_result is "Недопустимые символы" or car_number_check_result is None:
+                send_whapi_request1(car_number_check_result, number)  # Отправляем сообщение об ошибке
+
+            else:
+                # Конвертируем номер в английские буквы (если были русские)
+                car_number_eng = convert_to_english_letters(message.upper())
+                conn = sqlite3.connect('your_database.db')
+                cursor = conn.cursor()
+
+                # Исправленная SQL-запрос — добавлен FROM drivers
+                cursor.execute("SELECT COUNT() FROM drivers WHERE car_number = ? AND phone_number = ?", (car_number_eng, number))
+                count = cursor.fetchone()
+
+                if count[0] == 0:
+                    # Обновляем car_number для данного phone_number
+                    cursor.execute('''
+                        UPDATE drivers
+                        SET car_number = ?
+                        WHERE phone_number = ?''',
+                        (car_number_eng, number))
+                    conn.commit()
+                    # Закрываем соединение после коммита
+                    conn.close()
+
+                    print(car_number_eng, number, 'sdscs')
+                    send_verification_notification_telegram(car_number_eng)
+                    send_whapi_request1('Ваш запрос отправлен на подтверждение диспетчеру', number)
+                else:
+                    ...
+                    
+                    
+        if message == 'Ваш аккаунт успешно подтвержден, у вас есть доступ к функционалу бота.' and result_os[0] == "android" and bot[0]=='yes':
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            # SQL-запрос для обновления
+            sql_query = '''
+            UPDATE drivers
+            SET driver_status = "Неактивен"
+            WHERE phone_number = ?
+            '''
+            # Выполнение запроса
+            cursor.execute(sql_query, (number,))
+            conn.commit()
+            send_whapi_request1("Ожидайте маршрут!",number)
+        if message == 'Ваш аккаунт успешно подтвержден, у вас есть доступ к функционалу бота.' and result_os[0] == 'ios':
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            # SQL-запрос для обновления
+            sql_query = '''
+            UPDATE drivers
+            SET driver_status = "Неактивен"
+            WHERE phone_number = ?
+            '''
+            # Выполнение запроса
+            cursor.execute(sql_query, (number,))
+            conn.commit()
+            send_whapi_request1("Ожидайте маршрут!",number)
+
+        if message == "Прибыл на погрузку" and bot != (None,) and driver_status[0] != 'На перерыве' and driver_status2[0] != "На выгрузку" and 'reply' in i:
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            
+            # SQL-запрос для обновления
+            sql_query = '''
+            UPDATE drivers
+            SET driver_status = 'На погрузке'
+            WHERE phone_number = ?
+            '''
+            
+            # Выполнение запроса
+            cursor.execute(sql_query, (number,))
+            
+            # Сохранение изменений и закрытие соединения
+            conn.commit()
+            # Записываем время начала погрузки и меняем состояние
+            now = datetime.now()
+            cursor.execute("UPDATE drivers SET at_loading = 1, pogruzka_start_time = ? WHERE phone_number = ?", (now.isoformat(), number))
+            conn.commit()
+            conn.close()
+
+            payload = {
+                "header": { "text": "Вы прибыли на склад, начало погрузки зафиксировано." },
+                "action": { "buttons": [
+                        {
+                            "type": "quick_reply",
+                            "title": "Завершить погрузку",
+                            "id": "1"
+                        },
+                        {
+                            "type": "quick_reply",
+                            "title": "Связь с диспетчером",
+                            "id": "3"
+                        }
+                    ] },
+                "type": "button",
+                "to": number + '@s.whatsapp.net'
+            }
+            headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "authorization": f"Bearer {WHAPI_TOKEN}"
+            }
+
+            response = requests.post('https://gate.whapi.cloud/messages/interactive', json=payload, headers=headers)
+            #Запускаем поток для проверки времени погрузки
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT car_number FROM drivers WHERE phone_number = ?", (number,))
+            car = cursor.fetchone()
+            conn.close()
+            if car:
+                threading.Thread(target=send_delayed_message, args=(number, car[0])).start()
+        
+    
+        
+        
+        if message == "Прибыл на разгрузку" and 'reply' in i  and driver_status[0] != 'На перерыве' and bot != (None,):
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            
+            # SQL-запрос для обновления
+            sql_query = '''
+            UPDATE drivers
+            SET driver_status = 'На разгрузке'
+            WHERE phone_number = ?
+            '''
+            
+            # Выполнение запроса
+            cursor.execute(sql_query, (number,))
+            print(message)
+            # Сохранение изменений и закрытие соединения
+            conn.commit()
+            # cursor.execute("SELECT os FROM drivers WHERE phone_number = ?", (number,))
+            # a = cursor.fetchone()
+            payload = {
+            "header": {
+                "text": "Управление"
+            },
+            "action": {
+                "buttons": [
+                    {"type": "quick_reply", "title": "Завершить разгрузку", "id": "4"},
+                    {"type": "quick_reply", "title": "Связь с диспетчером", "id": "5"},
+                ]
+            },
+            "type": "button",
+            "to": number + "@s.whatsapp.net",
+            }
+            headers = {
+            "accept": "application/json",
+            "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+            }
+            response = requests.post('https://gate.whapi.cloud/messages/interactive', json=payload, headers=headers)
+                
+        if message == "Завершить разгрузку" and 'reply' in i  and bot != (None,):
+            
+            
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+
+            # SQL-запрос для обновления
+            # SQL-запрос для обновления
+            sql_query = '''
+            UPDATE drivers
+            SET driver_status2 = 'На погрузку', driver_status = 'В пути'
+            WHERE phone_number = ?
+            '''
+
+            # Выполнение запроса обновления
+            cursor.execute(sql_query, (number,))
+
+            # Запрос маршрута и номера машины
+            cursor.execute(
+                "SELECT route, car_number FROM drivers WHERE phone_number = ?",
+                (number,),
+            )
+
+            result = cursor.fetchone()
+            conn.commit()
+            conn.close()
+            if result[0] == "Софьино-Электросталь":
+                conn = sqlite3.connect('your_database.db')
+                cursor = conn.cursor()
+                
+                # SQL-запрос для обновления
+                sql_query = '''
+                UPDATE drivers
+                SET route = 'Электросталь-Софьино'
+                WHERE phone_number = ?
+                '''
+                
+                # Выполнение запроса
+                cursor.execute(sql_query, (number,))
+                print(message)
+                # Сохранение изменений и закрытие соединения
+                conn.commit()
+            if result:
+                route = result[0].split('-')
+                if len(route) > 0:  # Убедитесь, что маршрут непустой
+                    payload = {
+                        "header": {
+                            "text": f"Ваш маршрут. На склад В {route[0]}, Хорошей дороги!"
+                        },
+                        "action": {
+                            "buttons": [
+                                {"type": "quick_reply", "title": "Прибыл на погрузку", "id": "4"},
+                                {"type": "quick_reply", "title": "Связь с диспетчером", "id": "5"},
+                            ]
+                        },
+                        "type": "button",
+                        "to": number + "@s.whatsapp.net",
+                    }
+                    headers = {
+                        "accept": "application/json",
+                        "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                    }
+                    response = requests.post('https://gate.whapi.cloud/messages/interactive', json=payload, headers=headers)
+            else:
+                print("Нет результатов для указанного номера телефона.")
+
+        
+    
+        
+            
+        if message == "Завершить погрузку" and driver_status[0] != 'На перерыве' and driver_status[0] != 'Неактивен' and bot != (None,) and 'reply' in i:
+    
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            
+        
+            # SQL-запрос для обновления
+            sql_query = '''
+            UPDATE drivers
+            SET driver_status2 = "На выгрузку"
+            WHERE phone_number = ?
+            '''
+            
+            # Выполнение запроса
+            cursor.execute(sql_query, (number,))
+            conn.commit()
+            
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            # Сбрасываем состояние
+            cursor.execute("SELECT route FROM drivers WHERE phone_number = ?", (number,))
+            route = cursor.fetchone()
+            sql_query = '''
+            UPDATE drivers
+            SET driver_status = 'В пути'
+            WHERE phone_number = ?
+            '''
+            
+            # Выполнение запроса
+            cursor.execute(sql_query, (number,))
+            s = (route[0]).split('-')
+            cursor.execute("UPDATE drivers SET at_loading = 0, pogruzka_start_time = NULL WHERE driver_status = 'В пути' OR phone_number = ?", (number,))
+            conn.commit()
+            conn.close()
+            payload = {
+                "header": { "text": "Погрузка завершена. Ваш маршрут: " + s[1] + " , Хорошей дороги!" },
+                "action": { "buttons": [
+                        {
+                            "type": "quick_reply",
+                            "title": "Прибыл на разгрузку",
+                            "id": "9"
+                        },
+                        {
+                            "type": "quick_reply",
+                            "title": "Связь с диспетчером",
+                            "id": "3"
+                        }
+                    ] },
+                "type": "button",
+                "to": number + '@s.whatsapp.net'
+            }
+            headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "authorization": f"Bearer {WHAPI_TOKEN}"
+            }
+
+            response = requests.post('https://gate.whapi.cloud/messages/interactive', json=payload, headers=headers)
+            
+        
+
+        
+            
+        
+        
+        if message == "Связь с диспетчером" and 'reply' in i:
+            conn = sqlite3.connect('your_database.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT route FROM drivers WHERE phone_number = ?", (number,))
+            route = cursor.fetchone()
+            cursor.execute("SELECT phone_number FROM drivers WHERE phone_number = ?", (number,))
+            result1 = cursor.fetchone()
+            conn.close()
+
+            # Получение текущего времени и дня недели
+            now = datetime.now()
+            current_time = now.time()
+            current_day = now.weekday()  # 0 — понедельник, 6 — воскресенье
+
+            # Определение контакта по времени и дню недели
+            if current_time >= datetime.strptime("21:00", "%H:%M").time() or current_time < datetime.strptime("09:00", "%H:%M").time():
+                # url = "https://gate.whapi.cloud/messages/contact"
+
+                # payload = {
+                #     "to": number,
+                #     "name": "Диспетчер",
+                #     "vcard": "BEGIN:VCARD      VERSION:3.0      FN:Алексей      TEL;TYPE=CELL:+79001664820      EMAIL:example@example.com      END:VCARD"
+                # }
+                # headers = {
+                #     "accept": "application/json",
+                #     "content-type": "application/json",
+                #     "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                # }
+
+                # response = requests.post(url, json=payload, headers=headers)
+                send_whapi_request1("Диспетчер Алексей, +79001664820",number)
+            elif current_day in range(0, 5):  # Пн-Пт
+                # url = "https://gate.whapi.cloud/messages/contact"
+
+                # payload = {
+                #     "to": number,
+                #     "name": "Диспетчер",
+                #     "vcard": "BEGIN:VCARD      VERSION:3.0      FN:Динара      TEL;TYPE=CELL:+7 927 161-23-60      EMAIL:example@example.com      END:VCARD"
+                # }
+                # headers = {
+                #     "accept": "application/json",
+                #     "content-type": "application/json",
+                #     "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                # }
+
+                # response = requests.post(url, json=payload, headers=headers)
+                send_whapi_request1("Диспетчер Динара, +79271612360",number)
+            else:  # Сб-Вс
+                # url = "https://gate.whapi.cloud/messages/contact"
+
+                # payload = {
+                #     "to": number,
+                #     "name": "Диспетчер",
+                #     "vcard": "BEGIN:VCARD      VERSION:3.0      FN:Карина      TEL;TYPE=CELL:79884994041      EMAIL:example@example.com      END:VCARD"
+                # }
+                # headers = {
+                #     "accept": "application/json",
+                #     "content-type": "application/json",
+                #     "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+                # }
+
+                # response = requests.post(url, json=payload, headers=headers)    
+                send_whapi_request1("Диспетчер Карина, +79884994041",number) 
+
+        
+        
+
+        
+        return "OK", 200
+    except KeyError as e:
+        return f"KeyError: {str(e)}", 400
+    except HTTPError as err:
+        return f"HTTP Error: {str(err)}", err.response.status_code if hasattr(err, 'response') else 400
+    except Exception as e:
+        return f"Error: {str(e)}", 400
+
+    
+@app.route('/', methods=['GET'])
+def index():
+    return 'Bot is running'
+
+
+def run_telegram_bot():
+    bot.remove_webhook()
+
+def send_route_assigned_buttons(phone_number, route):
+    """Отправляет водителю кнопки 'Прибыл на погрузку' и 'Связь с диспетчером'."""
+    url = "https://gate.whapi.cloud/messages/interactive"
+
+    payload = {
+            "header": { "text": route + ", Хорошей дороги!" },
+            "action": { "buttons": [
+                    {
+                        "type": "quick_reply",
+                        "title": "Прибыл на погрузку",
+                        "id": "4"
+                    },
+                    {
+                        "type": "quick_reply",
+                        "title": "Связь с диспетчером",
+                        "id": "5"
+                    }
+                ] },
+            "type": "button",
+            "to": phone_number + '@s.whatsapp.net'
+            }
+    headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "authorization": f"Bearer {WHAPI_TOKEN}"
+        }
+    response = requests.post(url, json=payload, headers=headers)
+
+
+def check_inactive_drivers():
+    """
+    Checks for drivers with 'Неактивен' status for 1 hour and sends a reminder.
+    Runs every minute to ensure timely reminders.
+    """
+    while True:
+        try:
+            time.sleep(3600)
+            conn = sqlite3.connect('your_database.db', check_same_thread=False)
+            cursor = conn.cursor()
+
+            # Get all inactive drivers
+            cursor.execute("SELECT phone_number FROM drivers WHERE driver_status = 'Неактивен'")
+            inactive_drivers = cursor.fetchall()
+
+            now = datetime.now()
+            for driver in inactive_drivers:
+                phone_number = driver[0]
+
+                # Retrieve the last update time for this driver.  If there is no entry
+                # or the time cannot be parsed then we assume a time far in the past so
+                # they will not be prodded until the condition is met.
+                cursor.execute("SELECT timepogruzka FROM drivers WHERE phone_number = ?", (phone_number,))
+                last_update_time_str = cursor.fetchone()
+                cursor.execute("SELECT os FROM driverd WHERE phone_number = ?",(phone_number,))
+                os = os.fetchone()[0]
+                if last_update_time_str and last_update_time_str[0]:
+                    try:
+                        last_update_time = datetime.fromisoformat(last_update_time_str[0])
+                    except ValueError:
+                        last_update_time = datetime.min  # Far past
+
+                else:
+                    last_update_time = datetime.min  # Far past
+
+                # Check if the driver has been inactive for more than 1 hour
+                inactive_duration = now - last_update_time
+                if inactive_duration >= timedelta(hours=1):
+                    if os == 'android':
+                        # Send the reminder
+                        send_whapi_request1("Бездействие один час")
+                    else:
+                        send_whapi_request1("Бездействие один час")
+
+            conn.close()
+
+        except Exception as e:
+            ...
+            # Log the error, consider sending a notification to the admin
+
+        time.sleep(60)  # Check every minute
+
+
+if __name__ == '__main__':
+    # Запускаем поток для Telegram
+    threading.Thread(target=run_telegram_bot).start()
+
+    # Запускаем поток для проверки неактивности водителей
+    threading.Thread(target=check_inactive_drivers).start()
+
+    app.run(port=int(os.getenv('PORT', 80)), debug=True)
