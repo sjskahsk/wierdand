@@ -1,0 +1,1089 @@
+
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import threading
+import time
+from functools import wraps
+from datetime import datetime
+from datetime import datetime, timedelta
+import bcrypt
+import pandas as pd
+import requests
+import telebot
+from dotenv import load_dotenv
+from flask import Flask, request
+from telebot import types
+
+# --- Configuration ---
+load_dotenv()
+
+# Required Constants (Ensure these are set in your .env file)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")  # Ensure CHAT_ID is a string
+WHAPI_TOKEN = os.getenv("WHAPI_TOKEN")
+
+# Optional Constants (with defaults)
+DATABASE_NAME = os.getenv("DATABASE_NAME", "your_database.db")
+FLASK_PORT = int(os.getenv("FLASK_PORT", 80))
+FLASK_HOST = '0.0.0.0'
+REPORT_INTERVAL_HOURS = int(os.getenv("REPORT_INTERVAL_HOURS", 6))
+ORIGINAL_FILE_PATH = "drivers.xlsx"
+COPY_FILE_PATH = "drivers_copy.xlsx"
+
+# City Lists (Define these clearly)
+LOADING_CITIES = ["Электросталь", "Софьино"]
+UNLOADING_CITIES = ["Софьино", "Электросталь"]
+
+# WhatsApp API URLs
+WHAPI_API_URL = "https://gate.whapi.cloud/messages/text"
+WHAPI_API_URL1 = "https://gate.whapi.cloud/messages/interactive"
+
+# --- Logging Setup ---
+logging.basicConfig(
+    filename="bot.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# --- Bot and Flask Initialization ---
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+app = Flask(__name__)
+
+# --- Database Connection ---
+def get_db_connection():
+    """Gets a database connection."""
+    conn = sqlite3.connect(DATABASE_NAME, check_same_thread=False)
+    conn.row_factory = sqlite3.Row  # Access columns by name
+    return conn
+
+# --- WhatsApp API Functions ---
+def send_whapi_request(payload):
+    """Sends a request to the WhatsApp API (text messages)."""
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {WHAPI_TOKEN}",
+    }
+    try:
+        response = requests.post(WHAPI_API_URL, json=payload, headers=headers)
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        logging.info(f"WhatsApp API request (text) successful. Response: {response.text}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending WhatsApp (text) message: {e}")
+        send_message_to_admin(f"Ошибка при отправке сообщения WhatsApp (текст): {e}")  # Notify admin
+
+
+def delete_driver_by_phone(message):
+    """
+    Удаляет строку из таблицы drivers, где phone_number равен заданному номеру.
+    
+    Args:
+        number (str): Номер телефона для поиска и удаления записи
+    """
+    car_number = message.text
+    car = translate_car_number(car_number)
+    try:
+        conn = sqlite3.connect('your_database.db')
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM drivers WHERE car_number = ?", (car,))
+        conn.commit()
+        bot.send_message(CHAT_ID,"Запись этого водителя удалена")
+    except sqlite3.Error as e:
+        print(f"Ошибка при удалении записи: {e}")
+    finally:
+        # Закрывать соединение здесь не нужно, если оно используется дальше
+        pass
+
+
+def send_whapi_interactive_request(payload):
+    """Sends a request to the WhatsApp API (interactive messages)."""
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "authorization": f"Bearer {WHAPI_TOKEN}",
+    }
+    try:
+        response = requests.post(WHAPI_API_URL1, json=payload, headers=headers)
+        response.raise_for_status()
+        logging.info(f"WhatsApp API request (interactive) successful. Response: {response.text}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending WhatsApp (interactive) message: {e}")
+        send_message_to_admin(f"Ошибка при отправке сообщения WhatsApp (interactive): {e}")  # Notify admin
+
+
+# --- Helper function to send messages to admins ---
+def send_message_to_admin(message_text):
+    """Sends a message to all administrators."""
+    try:
+        with open("admins.txt", "r", encoding="utf-8") as f:
+            admin_ids = [int(line.strip()) for line in f]  # Read admin IDs as integers
+    except FileNotFoundError:
+        logging.error("admins.txt file not found!")
+        return
+
+    for admin_id in admin_ids:
+        try:
+            bot.send_message(admin_id, message_text)
+        except telebot.apihelper.ApiException as e:
+            logging.error(f"Failed to send message to admin {admin_id}: {e}")
+
+
+# --- Authentication and Authorization ---
+def admin_required(func):
+    """Decorator to check if a user is an admin."""
+
+    @wraps(func)
+    def wrapper(message, *args, **kwargs):
+        try:
+            with open("admins.txt", "r", encoding="utf-8") as f:
+                admins = [line.strip() for line in f]
+        except FileNotFoundError:
+            logging.error("admins.txt file not found!")
+            bot.send_message(
+                CHAT_ID,
+                "Ошибка: Файл admins.txt не найден. Обратитесь к администратору.",
+            )
+            return
+
+        if str(message.chat.id) in admins:
+            return func(message, *args, **kwargs)
+        else:
+            bot.send_message(CHAT_ID, "У вас нет прав для выполнения этой команды.")
+            return
+
+    return wrapper
+
+
+@bot.message_handler(commands=["start"])
+def start_command(message):
+    """Handles the /start command.  Checks for admin status, otherwise prompts for password."""
+    try:
+        with open("admins.txt", "r", encoding="utf-8") as file:
+            admins = [line.strip() for line in file]
+        if str(message.chat.id) in admins:
+            admin_panel(message)
+        else:
+            bot.send_message(CHAT_ID, "Введите пароль:")
+            bot.register_next_step_handler(message, password_check)
+    except FileNotFoundError:
+        bot.send_message(
+            CHAT_ID,
+            "Файл admins.txt не найден. Обратитесь к администратору для настройки доступа.",
+        )
+
+
+def password_check(message):
+    """Checks the password against a secure hash."""
+    entered_password = message.text
+    # Replace 'your_hashed_password' with a securely generated hash using bcrypt
+    hashed_password = b"$2b$12$EXAMPLE.UNSECURE.HASH"  # INSECURE - REPLACE ME!
+
+    if bcrypt.checkpw(entered_password.encode("utf-8"), hashed_password):
+        try:
+            with open("admins.txt", "a", encoding="utf-8") as file:
+                file.write(str(message.chat.id) + "\n")
+            admin_panel(message)
+        except Exception as e:
+            logging.exception("Error writing admin to file.")
+            bot.reply_to(message, f"Ошибка при записи в файл: {e}")
+            send_message_to_admin(f"Ошибка при записи ID администратора в файл: {e}")
+
+    else:
+        bot.send_message(message.chat.id, "Пароль неверный")
+        start_command(message)
+
+# --- Admin Panel ---
+@admin_required
+def admin_panel(message):
+    """Sends the admin panel."""
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    button_excel = types.KeyboardButton(text="Удалить водителя")
+    button_report = types.KeyboardButton(text="Получить отчёт")
+    button_send_message = types.KeyboardButton(text="Отправить сообщение водителю")
+    button_add_route = types.KeyboardButton(text="Добавить маршрут водителю")
+    item1 = types.KeyboardButton("Изменить статус водителя")
+
+    markup.add(button_report, button_send_message, button_add_route,button_excel)
+    markup.row(item1)
+    bot.send_message(CHAT_ID, "Панель администратора:", reply_markup=markup)
+
+
+
+# Обработчик выбора изменить статус водителя
+@bot.message_handler(func=lambda message: message.text == "Изменить статус водителя")
+def change_driver_status(message):
+    bot.reply_to(message, "Введите номер машины:")
+    bot.register_next_step_handler(message, ask_status)
+
+def ask_status(message):
+    global current_vehicle_number
+    current_vehicle_number = message.text.strip()
+    if len(current_vehicle_number) == 3:
+        fd = current_vehicle_number
+        query = "SELECT phone_number,car_number FROM drivers WHERE LOWER(car_number) LIKE ?"
+        param = ('%' + '777' + '%',)
+        print("Запрос:", query, "Параметр:", param)
+        cursor.execute(query, param)
+        a = cursor.fetchall()[0]
+        print(a[1] + "Номер машины",a[0] + "Номер машины")
+        if a:
+            bot.reply_to(message, "Выберите статус водителя:", reply_markup=status_menu())
+        else:
+            bot.send_message(message.chat.id, "ГРЗ не найден. Проверьте номер")
+    else:
+        current_vehicle_number = translate_car_number(current_vehicle_number)
+        conn = sqlite3.connect('your_database.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT phone_number FROM drivers WHERE car_number = ?", (current_vehicle_number,))
+        a = cursor.fetchone()
+        if a:
+            bot.reply_to(message, "Выберите статус водителя:", reply_markup=status_menu())
+        else:
+            bot.send_message(message.chat.id, "ГРЗ не найден. Проверьте номер")
+
+def status_menu():
+    markup = types.InlineKeyboardMarkup()
+    item1 = types.InlineKeyboardButton("Отдых", callback_data="status_отдых")
+    item2 = types.InlineKeyboardButton("ТО", callback_data="status_то")
+    item3 = types.InlineKeyboardButton("Другое", callback_data="status_другое")
+    markup.add(item1, item2, item3)
+    return markup
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("status_"))
+def handle_status_callback(call):
+    bot.delete_message(call.message.chat.id, call.message.id)
+    global current_vehicle_number  # Получаем номер машины из глобальной переменной
+    status_map = {
+        "status_отдых": "Отдых",
+        "status_то": "ТО",
+        "status_другое": "Другое"
+    }
+    status = status_map.get(call.data)
+    
+    # Теперь добавляем статус в callback_data для кнопок времени
+    bot.send_message(call.message.chat.id, "Выберите время для перерыва:", reply_markup=generate_time_keyboard(status))
+
+def generate_time_keyboard(status):
+    keyboard = types.InlineKeyboardMarkup()
+    buttons = [
+        types.InlineKeyboardButton(text="3 часа", callback_data=f"time_3_{status}"),
+        types.InlineKeyboardButton(text="4 часа", callback_data=f"time_4_{status}"),
+        types.InlineKeyboardButton(text="5 часов", callback_data=f"time_5_{status}"),
+        types.InlineKeyboardButton(text="6 часов", callback_data=f"time_6_{status}"),
+        types.InlineKeyboardButton(text="1 день", callback_data=f"time_1d_{status}"),
+        types.InlineKeyboardButton(text="2 дня", callback_data=f"time_2d_{status}"),
+    ]
+    keyboard.add(*buttons)
+    return keyboard
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("time_"))
+def handle_time_selection(call):
+    selected_time, status = call.data.split('_')[1], call.data.split('_')[2]  # Получаем значение времени и статус
+    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                          text=f"Вы выбрали: {selected_time}. Статус: {status}", reply_markup=None)
+
+    time_input = selected_time  # Например, время можно сохранить из выбранного варианта
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT phone_number FROM drivers WHERE car_number = ?", (current_vehicle_number,))
+    a = cursor.fetchone()
+    
+    if a:
+        sql_query = '''
+            UPDATE drivers
+            SET driver_status = ?, timeout = ?
+            WHERE phone_number = ?
+        '''
+        cursor.execute(sql_query, (status, time_input, a[0],))
+        conn.commit()
+        conn.close()
+
+        bot.send_message(call.message.chat.id, f"Статус Водителя {current_vehicle_number} обновлен на {status}. На: {time_input} Часа.")
+def start_timer(time_input, vehicle_number):
+    hours = map(int, (time_input.split(' '))[0])
+    
+    # Конвертация времени в секунды
+    total_seconds = hours * 3600
+    time.sleep(total_seconds)  # Ждем указанное время
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT phone_number FROM drivers WHERE car_number = ?", (current_vehicle_number,))
+    a = cursor.fetchone()
+    # Отправка уведомления диспетчеру
+    bot.send_message(CHAT_ID, f"Перерыв для водителя {vehicle_number} истёк.")
+    send_whapi_request1("Ваш перерыв закончен",a[0])
+
+
+def send_whapi_request1(text, number):
+    """Отправляет текстовое сообщение через WHAPI."""
+    try:
+        url = "https://gate.whapi.cloud/messages/text"
+
+        payload = {
+            "typing_time": 0,
+            "body": text,
+            "to": str(number+"@s.whatsapp.net")
+        }
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "authorization": f"Bearer {WHAPI_TOKEN}"
+        }
+
+        response = requests.post(url, json=payload, headers=headers)
+
+    except requests.exceptions.RequestException as e:
+        ...
+@bot.message_handler(func=lambda message: message.text == "Добавить маршрут водителю")
+def ask_car_number_for_route(message):
+    """Asks for the car number to add a route."""
+    bot.send_message(
+        CHAT_ID, "Введите номер машины водителя, которому хотите добавить маршрут:"
+    )
+    bot.register_next_step_handler(message, get_car_number)
+    
+    
+@bot.message_handler(func=lambda message: message.text == "Удалить водителя")
+def ask_car_number_for_route(message):
+    bot.send_message(
+        CHAT_ID, "Введите номер машины водителя, которого вы хотите удалить:"
+    )
+    bot.register_next_step_handler(message, delete_driver_by_phone)
+    
+
+# State storage
+driver_route_state = {}
+def translate_car_number(car_number):
+    trans_dict = {
+        'А': 'A',
+        'В': 'B',
+        'Е': 'E',
+        'К': 'K',
+        'М': 'M',
+        'Н': 'H',
+        'О': 'O',
+        'Р': 'P',
+        'С': 'C',
+        'Т': 'T',
+        'У': 'Y',
+        'Х': 'X'
+    }
+    
+    result = []
+    for char in car_number.upper():
+        # Если символ есть в словаре замены, заменяем его
+        if char in trans_dict:
+            result.append(trans_dict[char])
+        else:
+            result.append(char)
+    return ''.join(result)
+
+
+
+
+
+def get_car_number(message):
+    """Gets the car number to add a route."""
+    car_number = message.text.strip()
+    car = translate_car_number(car_number)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "SELECT phone_number,car_number FROM drivers WHERE LOWER(car_number) LIKE ?"
+    param = ('%' + car + '%',)
+    print("Запрос:", query, "Параметр:", param)
+
+    cursor.execute(query, param)
+    a = cursor.fetchall()[0]
+    print(a[1] + "Номер машины",a[0] + "Номер машины")
+    conn.close()
+    
+    if a:
+        # Store car_number in state
+        driver_route_state[message.chat.id] = {'car_number': a[1]}
+        # Send loading city selection
+        send_city_selection_message(message.chat.id, "Выберите город загрузки:", LOADING_CITIES, "loading")
+    else:
+        bot.send_message(message.chat.id, "ГРЗ не найден. Проверьте номер")
+
+
+def send_city_selection_message(chat_id, text, cities, city_type):
+    """Sends a message with inline buttons to select a city."""
+    markup = types.InlineKeyboardMarkup(row_width=1)  # Stack buttons vertically
+    for city in cities:
+        markup.add(types.InlineKeyboardButton(city, callback_data=f"city:{city}:{city_type}"))
+    bot.send_message(chat_id, text, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("city:"))
+def city_callback_handler(call):
+    """Handles the city selection callback."""
+    chat_id = call.message.chat.id
+    data = call.data.split(":")
+    city = data[1]
+    city_type = data[2]
+
+    if chat_id not in driver_route_state:
+        bot.answer_callback_query(call.id, "Пожалуйста, начните процесс добавления маршрута заново.")
+        return
+
+    if city_type == "loading":
+        # Store loading city and ask for unloading city
+        driver_route_state[chat_id]['loading_city'] = city
+        bot.delete_message(chat_id=chat_id, message_id=call.message.message_id)
+        send_city_selection_message(chat_id, "Выберите город выгрузки:", UNLOADING_CITIES, "unloading")
+
+    elif city_type == "unloading":
+        # Store unloading city and finalize route
+        driver_route_state[chat_id]['unloading_city'] = city
+        bot.delete_message(chat_id=chat_id, message_id=call.message.message_id)
+        finalize_route(chat_id)
+    bot.answer_callback_query(call.id, text="Выбрано!")
+    bot.send_message(CHAT_ID,f"Водителю успешно выдан маршрут: {driver_route_state[chat_id]['loading_city']} - {driver_route_state[chat_id]['unloading_city']}")
+
+
+def finalize_route(chat_id):
+    """Finalizes the route by saving it to the database and sending a confirmation."""
+    if 'loading_city' not in driver_route_state[chat_id] or 'unloading_city' not in driver_route_state[chat_id]:
+        bot.send_message(chat_id, "Ошибка: Не выбраны города загрузки и/или выгрузки.")
+        return
+
+    car_number = driver_route_state[chat_id]['car_number']
+    loading_city = driver_route_state[chat_id]['loading_city']
+    unloading_city = driver_route_state[chat_id]['unloading_city']
+    route = f"{loading_city} - {unloading_city}"
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    sql_query = """
+        UPDATE drivers
+        SET driver_status = ?, route = ?
+        WHERE car_number = ?"""
+    cursor.execute(sql_query, ("В пути", route, car_number))
+    conn.commit()
+
+    # Send confirmation message
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT route, phone_number FROM drivers WHERE car_number = ?",
+        (car_number,),
+    )
+    route = route.split('-')
+    result = cursor.fetchone()
+    print(result)
+    if result:
+        conn = sqlite3.connect('your_database.db')
+        cursor = conn.cursor()
+        
+        # SQL-запрос для обновления
+        sql_query = '''
+        UPDATE drivers
+        SET driver_status2 = 'На погрузку'
+        WHERE phone_number = ?
+        '''
+        
+        # Выполнение запроса
+        cursor.execute(sql_query, (result[1],))
+        
+        # Сохранение изменений и закрытие соединения
+        conn.commit()
+        cursor.execute("SELECT os FROM drivers WHERE phone_number = ?", (result[1],))
+        a = cursor.fetchone()
+        if a[0] == "android":
+            payload = {
+            "header": {
+                "text": "Ваш новый маршрут. На склад В " + route[0] + ", Хорошей дороги!"
+            },
+            "action": {
+                "buttons": [
+                    {"type": "quick_reply", "title": "Прибыл на погрузку", "id": "4"},
+                    {"type": "quick_reply", "title": "Связь с диспетчером", "id": "5"},
+                ]
+            },
+            "type": "button",
+            "to": result[1] + "@s.whatsapp.net",
+            }
+
+            bot.send_message(chat_id, f"Маршрут: {route[0]} - {route[1]} \n для машины {car_number}✅")
+            send_whapi_interactive_request(payload)
+        else:
+            
+            url = "https://gate.whapi.cloud/messages/poll"
+        
+            # Формируем payload
+            payload = {
+                "options": ['Прибыл на погрузку','Связь с диспетчером'],  # Передаем операционные системы
+                "to": result[1]+"@s.whatsapp.net",
+                "count": 1,
+                "title": "Ваш новый маршрут. На склад В " + route[0] + ", Хорошей дороги!"
+            }
+            
+            headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "authorization": "Bearer CWXSfuLrcbBmZrWTivfC43CL6MIDH19T"
+            }
+
+            # Отправляем запрос
+            response = requests.post(url, json=payload, headers=headers)
+        
+    else:
+        bot.send_message(chat_id, f"Маршрут: {route[0]} - {route[1]} для машины {car_number}✅")
+        print("Нету")
+
+        # Clear state
+        del driver_route_state[chat_id]
+
+
+
+def send_route_confirmation_to_driver(phone_number, loading_city, route):
+    """Sends a route confirmation interactive message to the driver via WhatsApp."""
+    payload = {
+        "header": {
+            "text": f"Ваш новый маршрут. На склад в {loading_city}, Хорошей дороги!"
+        },
+        "action": {
+            "buttons": [
+                {"type": "quick_reply", "title": "Прибыл на погрузку", "id": "4"},
+                {"type": "quick_reply", "title": "Связь с диспетчером", "id": "5"},
+            ]
+        },
+        "type": "button",
+        "to": phone_number + "@s.whatsapp.net",
+    }
+    send_whapi_interactive_request(payload)
+
+
+# --- Driver Communication ---
+@bot.message_handler(func=lambda message: message.text == "Отправить сообщение водителю")
+@admin_required
+def ask_car_number(message):
+    """Asks for the car number to send a message."""
+    bot.send_message(
+        message.chat.id, "Введите номер машины водителя, которому хотите отправить сообщение:"
+    )
+    bot.register_next_step_handler(message, check_and_get_message_for_driver)  # Изменено
+
+def check_and_get_message_for_driver(message):
+    """Checks if the car number exists before asking for the message."""
+    car_number = message.text.strip()
+    car_number = translate_car_number(car_number)
+    current_vehicle_number = message.text.strip()
+    fd = current_vehicle_number
+    query = "SELECT phone_number,car_number FROM drivers WHERE LOWER(car_number) LIKE ?"
+    param = ('%' + '777' + '%',)
+    print("Запрос:", query, "Параметр:", param)
+    cursor.execute(query, param)
+    a = cursor.fetchall()[0]
+    print(a[1] + "Номер машины",a[0] + "Номер машины")
+    if a:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT phone_number FROM drivers WHERE car_number = ?",
+                (car_number,),
+            )
+            result = cursor.fetchone()
+            if result:
+                # Номер найден, запрашиваем сообщение
+                bot.send_message(
+                    message.chat.id, f"Введите сообщение для отправки водителю с номером машины {car_number}:"
+                )
+                bot.register_next_step_handler(
+                    message, lambda msg: send_message_to_driver(msg, car_number)
+                )
+            else:
+                # Номер не найден, сообщаем об этом
+                bot.reply_to(
+                    message, f"❌ Водитель с номером машины {car_number} не найден.")
+                logging.warning(f"Driver not found with car number: {car_number}")
+        except sqlite3.Error as e:
+            logging.exception(f"Database error checking car number: {e}")
+            bot.reply_to(message, f"❌ Ошибка базы данных: {e}")
+        except Exception as e:
+            logging.exception(f"Unexpected error checking car number: {e}")
+            bot.reply_to(message, f"❌ Произошла ошибка: {e}")
+        finally:
+            if conn:
+                conn.close()
+    else:
+        bot.send_message(CHAT_ID,"ГРЗ не найден!")
+
+def send_message_to_driver(message, driver_car_number):
+    """Sends a message to the driver via WhatsApp."""
+    response_text = message.text.strip()
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT phone_number FROM drivers WHERE car_number = ?",
+            (driver_car_number,),
+        )
+        result = cursor.fetchone()
+        if result:
+            phone_number = result[0]
+            payload = {
+                "typing_time": 0,
+                "to": str(phone_number) + "@s.whatsapp.net",
+                "body": "Сообщение от диспетчера: " + response_text,
+            }
+            send_whapi_request(payload)
+
+            confirmation_message = (
+                f"✅ *Сообщение отправлено водителю {driver_car_number}:*\n")
+            bot.reply_to(message, confirmation_message, parse_mode="MarkdownV2")
+            logging.info(
+            f"Message sent to driver {driver_car_number}: {response_text}"
+            )
+        else:
+            # Этот блок уже не должен выполняться, так как проверка делается раньше.
+            bot.reply_to(
+            message, f"❌ Водитель с номером машины {driver_car_number} не найден.")
+            logging.warning(f"Driver not found with car number: {driver_car_number}")
+    except sqlite3.Error as e:
+        logging.exception(f"Database error sending message: {e}")
+        bot.reply_to(message, f"❌ Ошибка базы данных: {e}")
+    except Exception as e:
+        logging.exception(f"Error sending WhatsApp message: {e}")
+        bot.reply_to(message, f"❌ Произошла ошибка: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+# --- Callback Handlers (Approval/Rejection) ---
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    """Handles inline keyboard callbacks."""
+    callback_data = call.data
+
+    if callback_data.startswith("add_route:"):
+        add_route_callback_handler(call) # Вызываем обработчик add_route
+    elif callback_data == "net_poezdka":
+        handle_poezdka_rejection(call)
+    elif callback_data == "yes":
+        handle_driver_approval(call)
+    elif callback_data == "no":
+        handle_driver_rejection(call)
+    elif callback_data == "yes_pribil":
+        handle_yes_pribil(call)
+    else:
+        logging.warning(f"Unknown callback data: {callback_data}")
+        bot.answer_callback_query(call.id, "Действие не поддерживается.")
+        send_message_to_admin(f"Получен неизвестный callback data: {callback_data}")
+
+def handle_yes_pribil(call):
+  """Handles the 'yes_pribil' callback."""
+  driver_car_number = call.message.text # Extract driver's car number
+
+  # Update status in SQL and Excel
+  update_driver_status(driver_car_number, "Прибыл в Котовске")
+  bot.send_message(CHAT_ID, "Введите сообщение для отправки водителю:")
+  bot.register_next_step_handler(
+    call.message, lambda message: send_message_to_driver(message, driver_car_number)
+  )
+
+
+def update_driver_status(car_number, new_status):
+  """Updates the driver's status in the SQL database."""
+  conn = sqlite3.connect('your_database.db')
+  cursor = conn.cursor()
+  try:
+    sql_query = """
+    UPDATE drivers
+    SET driver_status = ?
+    WHERE car_number = ?"""
+    cursor.execute(sql_query, (new_status, car_number))
+    conn.commit()
+  except sqlite3.Error as e:
+    print(f"Ошибка обновления статуса водителя: {e}")
+    send_message_to_admin(f"Ошибка обновления статуса водителя {e}")
+  finally:
+    conn.close()
+
+def handle_poezdka_rejection(call):
+  """Handles 'poezdka' rejection."""
+  try:
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    car_number = call.message.text[18:-3]
+    cursor.execute(
+      "SELECT phone_number FROM drivers WHERE car_number = ?", (car_number,)
+    )
+    result = cursor.fetchone()
+    if result:
+      bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=call.message.text + "\n\n❌ Отклонено",
+        reply_markup=None,
+      )
+      payload = {
+        "typing_time": 0,
+        "to": str(result["phone_number"]) + "@s.whatsapp.net",
+        "body": "Вам отказано",
+      }
+      send_whapi_request(payload)
+    else:
+      send_message_to_admin(f"Водитель с номером машины {car_number} не найден.")
+  except sqlite3.Error as e:
+    send_message_to_admin(f"Ошибка базы данных: {e}")
+  except Exception as e:
+    send_message_to_admin(f"Произошла ошибка: {e} 3")
+  finally:
+      conn.close()
+
+def handle_driver_approval(call):
+  """Handles new driver approval."""
+  try:
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    print(call.message.text)
+    car_number = str(call.message.text)[20:]
+    sql_query = """
+    UPDATE drivers
+    SET bot_accent = 'yes'
+    WHERE car_number = ?"""
+    cursor.execute(sql_query, (car_number,))
+    conn.commit()
+
+    cursor.execute(
+      "SELECT phone_number FROM drivers WHERE car_number = ?", (car_number,)
+    )
+    result = cursor.fetchone()
+    print(result[0])
+    payload = {
+        "typing_time": 0,
+        "to": result[0] + "@s.whatsapp.net",
+        "body": "Ваш аккаунт успешно подтвержден, у вас есть доступ к функционалу бота.",
+      }
+    markup = types.InlineKeyboardMarkup()
+    add_route_button = types.InlineKeyboardButton("Добавить маршрут водителю", callback_data=f"add_route:{car_number}")  # Change callback data
+    markup.add(add_route_button)
+    send_whapi_request(payload)
+    bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=call.message.text + "\n\n✅ Подтверждено",
+            reply_markup=markup,  # The modified keyboard
+        )
+
+  except sqlite3.Error as e:
+    print(f"Ошибка базы данных: {e}")
+    send_message_to_admin(f"Ошибка базы данных: {e}")
+  except Exception as e:
+    print(f"Произошла ошибка: {e} 2")
+    send_message_to_admin(f"Произошла ошибка: {e} 2")
+  finally:
+    if conn:
+      conn.close()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("add_route:"))
+def add_route_callback_handler(call):
+    bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=call.message.text
+            )
+    """Handles the 'Add route' callback."""
+    car_number = call.data.split(":")[1]  # Extract the car number from callback data
+    chat_id = call.message.chat.id
+    try:
+        # Временно сохраняем номер машины
+        # Store car_number in state
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT phone_number FROM drivers WHERE car_number = ?", (car_number,))
+        result = cursor.fetchone()
+        conn.close()
+        # Store car_number in state
+        if result:
+            # Store car_number in state
+            driver_route_state[call.message.chat.id] = {'car_number': car_number}
+            # Send loading city selection
+            send_city_selection_message(call.message.chat.id, "Выберите город загрузки:", LOADING_CITIES, "loading")
+        else:
+            bot.send_message(call.message.chat.id, "ГРЗ не найден. Проверьте номер")
+    except Exception as e:
+        print(f"Произошла ошибка: {e}")
+
+
+def handle_driver_rejection(call):
+  """Handles new driver rejection and deletes data."""
+  try:
+    conn = sqlite3.connect('your_database.db')
+    cursor = conn.cursor()
+    car_number = call.message.text[20:] # Extract car number
+
+    # Delete the driver's data from the database
+    sql_query = """
+    DELETE FROM drivers
+    WHERE car_number = ?"""
+    cursor.execute(sql_query, (car_number,))
+    conn.commit()
+
+    bot.edit_message_text(
+      chat_id=call.message.chat.id,
+      message_id=call.message.message_id,
+      text=call.message.text + "\n\n❌ Отклонено и удалено",
+      reply_markup=None,
+    )
+    bot.send_message(CHAT_ID, f"Данные водителя с номером {car_number} удалены.")
+    send_message_to_admin(f"Данные водителя с номером {car_number} удалены.")
+
+  except sqlite3.Error as e:
+    print(f"Ошибка базы данных: {e}")
+    send_message_to_admin(f"Ошибка базы данных: {e}")
+  except Exception as e:
+    print(f"Произошла ошибка: {e} 1")
+    send_message_to_admin(f"Произошла ошибка: {e} 1")
+  finally:
+    if conn:
+      conn.close()
+
+# --- File Management ---
+@bot.message_handler(func=lambda message: message.text == "Получить эксель с файлом")
+def get_excel_file(message):
+  """Sends a copy of the Excel file to the chat."""
+  try:
+    shutil.copy(ORIGINAL_FILE_PATH, COPY_FILE_PATH)
+    with open(COPY_FILE_PATH, "rb") as file:
+      bot.send_document(CHAT_ID, file)
+    os.remove(COPY_FILE_PATH)
+    bot.send_message(CHAT_ID, f"Файл Excel успешно отправлен.")
+    logging.info("Excel file sent to chat.")
+  except FileNotFoundError:
+    bot.reply_to(message, "Файл Excel не найден.")
+    logging.error("Excel file not found.")
+    send_message_to_admin("Файл Excel не найден.")
+  except Exception as e:
+    bot.reply_to(message, f"Произошла ошибка при работе с файлом: {e}")
+    logging.exception("Error sending excel file.")
+    send_message_to_admin(f"Произошла ошибка при работе с файлом Excel: {e}")
+
+# --- Report Generation ---
+@bot.message_handler(func=lambda message: message.text == "Получить отчёт")
+def generate_report(message):
+    """Generates and sends a driver report to the chat with sorting by routes."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.row_factory = sqlite3.Row
+
+        # Fetch all drivers
+        cursor.execute("SELECT route, car_number, driver_status, driver_status2, break_end_time FROM drivers")  # Fetch driver_status2 and break_end_time
+        drivers = cursor.fetchall()
+
+        # Group drivers by route (filtering out None routes)
+        routes = {}
+        for driver in drivers:
+            route = driver["route"]
+            if route is None:  # Skip drivers without a route
+                continue
+
+            if route not in routes:
+                routes[route] = []
+            routes[route].append(driver)
+
+        # Build the report message parts
+        report_parts = ["<b>Ежедневный отчет о водителях:</b>\n\n"]  # Use HTML bold tag
+
+        if not routes:  # If no drivers with routes found
+            report_parts.append("<i>Нет данных о водителях с назначенными маршрутами.</i>")  # Use HTML italics
+        else:
+            for route, driver_list in routes.items():
+                route_part = f"<b>Маршрут: {route}</b>\n\n"  # Use HTML bold tag
+
+                try:
+                    s = route.split("-")
+                    location_from = s[0].strip() if len(s) > 0 else "неизвестно"  # Strip whitespace
+                    location_to = s[1].strip() if len(s) > 1 else "неизвестно"  # Strip whitespace
+
+                    for driver in driver_list:
+                        what = ""  # Initialize what
+                        location = ""  # Initialize location
+                        break_end_time_str = driver["break_end_time"]
+
+                        if driver['driver_status'] == 'На перерыве':
+                            what = "на перерыве до"
+                            if break_end_time_str:
+                                try:
+                                    break_end_time = datetime.fromisoformat(break_end_time_str)
+                                    location = break_end_time.strftime('%Y-%m-%d %H:%M:%S')
+                                except ValueError:
+                                    location = "ошибка формата времени"
+                            else:
+                                location = "неизвестно"
+
+                        elif driver['driver_status'] == 'На погрузке':
+                            what = "находится"
+                            location = location_from
+                        elif driver['driver_status'] == 'На разгрузке':
+                            what = "находится"
+                            location = location_to
+                        elif driver['driver_status2'] == 'На погрузку':
+                            what = "в"
+                            location = location_from
+                        elif driver['driver_status2'] == 'На выгрузку':
+                            what = "в"
+                            location = location_to
+                        else:  # Handle cases where status is unknown
+                            what = "имеет статус"
+                            location = "не определен"
+                        if what == 'на перерыве до':
+                            driver_info = (
+                                f"- Автомобиль: {driver['car_number']} {what}: {location[-14:]} (в {location_from})\n"  # Include both statuses
+                            )
+                        else:
+                            driver_info = (
+                                f"- Автомобиль: {driver['car_number']} {what}: {location} ({driver['driver_status']})\n"  # Include both statuses
+                            )
+
+                        # Check if adding this driver would exceed the limit
+                        if len(route_part) + len(driver_info) > 4000:
+                            report_parts.append(route_part)
+                            route_part = driver_info
+                        else:
+                            route_part += driver_info
+
+                    report_parts.append(route_part)
+                except Exception as e:
+                    error_msg = f"<i>Ошибка обработки маршрута {route}: {str(e)}</i>\n\n"  # Use HTML italics
+                    report_parts.append(error_msg)
+
+        # Send the report in parts
+        for part in report_parts:
+            if part.strip():  # Only send non-empty parts
+                try:
+                    bot.send_message(message.chat.id, part, parse_mode="HTML")  # Use HTML parse mode
+                except Exception as e:
+                    logging.error(f"Ошибка отправки сообщения: {e}")
+        
+        logging.info("Daily report generated and sent.")
+
+    except sqlite3.Error as db_err:
+        logging.error(f"Ошибка базы данных: {db_err}")
+        bot.send_message(message.chat.id, "<i>Ошибка при подключении к базе данных.  Обратитесь к администратору.</i>", parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Непредвиденная ошибка: {e}")
+        bot.send_message(message.chat.id, "<i>Произошла непредвиденная ошибка.  Обратитесь к администратору.</i>", parse_mode="HTML")
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Scheduled Report ---
+def send_scheduled_report():
+  """Sends a scheduled report with drivers information."""
+  while True:
+    time.sleep(REPORT_INTERVAL_HOURS * 3600) # Convert hours to seconds
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.row_factory = sqlite3.Row
+
+        # Fetch all drivers
+        cursor.execute("SELECT route, car_number, driver_status, driver_status2 FROM drivers")  # Fetch driver_status2
+        drivers = cursor.fetchall()
+
+        # Group drivers by route (filtering out None routes)
+        routes = {}
+        for driver in drivers:
+            route = driver["route"]
+            if route is None:  # Skip drivers without a routeescape_markdown
+                continue
+
+            if route not in routes:
+                routes[route] = []
+            routes[route].append(driver)
+
+        # Build the report message parts
+        report_parts = ["Ежедневный отчет о водителях:\n\n"]
+
+        if not routes:  # If no drivers with routes found
+            report_parts.append("Нет данных о водителях с назначенными маршрутами.")
+        else:
+            for route, driver_list in routes.items():
+                route_part = f"Маршрут: {route}\n\n"
+
+                try:
+                    s = route.split("-")
+                    location_from = s[0] if len(s) > 0 else "неизвестно"
+                    location_to = s[1] if len(s) > 1 else "неизвестно"
+
+                    for driver in driver_list:
+                        location = location_to  # Default to unloading location3
+                        if driver['driver_status'] == 'На погрузке':
+                            what = "Находится"
+                            location = location_from  # If loading, use loading location
+                        elif driver['driver_status'] == 'На разгрузке':
+                            what = "Находится"
+                            location = location_to  # If loading, use loading location
+                        elif driver['driver_status2'] == 'На погрузку':
+                            what = "В"
+                            location = location_from  # If driver_status2 is 'На погрузке'
+                        elif driver['driver_status2'] == 'На выгрузку':
+                            what = "В"
+                            location = location_to # if driver_status2 is 'На выгрузке'
+                        
+                        driver_info = (
+                            f"- Автомобиль: {driver['car_number']} "
+                            f" {driver['driver_status']} "
+                            f" {what}: {location}\n"
+                        )
+                        
+                        # Check if adding this driver would exceed the limit
+                        if len(route_part) + len(driver_info) > 4000:
+                            report_parts.append(route_part)
+                            route_part = driver_info
+                        else:
+                            route_part += driver_info
+                    
+                    report_parts.append(route_part)
+                except Exception as e:
+                    error_msg = f"Ошибка обработки маршрута {route}: {str(e)}\n\n"
+                    report_parts.append(error_msg)
+
+        # Send the report in parts
+        for part in report_parts:
+            if part.strip():  # Only send non-empty parts
+                bot.send_message(CHAT_ID, part, parse_mode="HTML")
+        
+        logging.info("Daily report generated and sent.")
+
+    except sqlite3.Error as e:
+        bot.send_message(CHAT_ID, f"❌ Ошибка базы данных при создании отчета: {e}")
+        logging.exception("Database error generating report.")
+        send_message_to_admin(f"Ошибка базы данных при создании отчета: {e}")
+    except Exception as e:
+        bot.send_message(CHAT_ID, f"❌ Произошла ошибка при создании отчета: {e}")
+        logging.exception("Error generating report.")
+        send_message_to_admin(f"Произошла ошибка при создании отчета: {e}")
+    finally:
+        if conn:
+             if conn:
+                conn.close()
+
+# --- Flask Integration (if needed) ---
+def run_flask():
+   """Runs the Flask app."""
+   app.run(host=FLASK_HOST, port=FLASK_PORT)
+
+# --- Main ---
+if __name__ == "__main__":
+  # Ensure necessary environment variables are set
+  if not all([TELEGRAM_TOKEN, CHAT_ID, WHAPI_TOKEN]):
+    logging.critical("Missing required environment variables (TELEGRAM_TOKEN, CHAT_ID, WHAPI_TOKEN). Exiting.")
+    raise ValueError("Missing required environment variables. Check your .env file.")
+
+  bot.remove_webhook()
+  threading.Thread(target=send_scheduled_report, daemon=True).start() # Use daemon threads
+  threading.Thread(target=run_flask, daemon=True).start()
+  bot.remove_webhook()
+  bot.infinity_polling()
